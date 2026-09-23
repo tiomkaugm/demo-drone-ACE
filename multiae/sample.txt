@@ -1,0 +1,1407 @@
+Source Code
+
+Struktur Folder & File
+Buat susunan folder seperti ini:
+
+enterprise_multi_agent_system/
+├── requirements.txt
+├── .env
+├── start_all_linux.sh
+├── start_all_windows.bat
+├──  finance_server/
+	├── data/finance.db
+	├── __init__.py
+	├── agents.py
+	├── app.py
+	├── database.py
+	└── ui.py
+├──  inventory_server/
+	├── data/inventory.db
+	├── __init__.py
+	├── agents.py
+	├── app.py
+	├── database.py
+	└── ui.py
+├──  sales_server/
+	├── data/sales.db
+	├── __init__.py
+	├── agents.py
+	├── app.py
+	├── database.py
+	└── ui.py
+├── management_server/
+	├── __init__.py
+	├── agents.py
+	├── app.py
+	├── database.py
+	└── ui.py
+├──  communication/
+	├── message_bus.py
+	├── message.py
+	└── service_directory.py
+├──  service_directory/
+	└── app.py
+├──  shared/
+	├── base_agent.py
+	├── config.py
+	└── database.py
+
+
+
+
+requirements.txt
+fastapi>=0.115
+uvicorn>=0.30
+streamlit>=1.40
+requests>=2.32
+pandas>=2.2
+pydantic>=2.9
+
+
+.env
+DIRECTORY_URL=http://127.0.0.1:9000
+FINANCE_URL=http://127.0.0.1:8101
+INVENTORY_URL=http://127.0.0.1:8102
+SALES_URL=http://127.0.0.1:8103
+MANAGEMENT_URL=http://127.0.0.1:8104
+
+start_all_linux.sh
+#!/usr/bin/env bash
+export PYTHONPATH="$(pwd)"
+uvicorn service_directory.app:app --host 0.0.0.0 --port 9000 &
+sleep 2
+uvicorn finance_server.app:app --host 0.0.0.0 --port 8101 &
+uvicorn inventory_server.app:app --host 0.0.0.0 --port 8102 &
+uvicorn sales_server.app:app --host 0.0.0.0 --port 8103 &
+uvicorn management_server.app:app --host 0.0.0.0 --port 8104 &
+sleep 3
+streamlit run finance_server/ui.py --server.port 8501 &
+streamlit run inventory_server/ui.py --server.port 8502 &
+streamlit run sales_server/ui.py --server.port 8503 &
+streamlit run management_server/ui.py --server.port 8504 &
+wait
+
+
+start_all_windows.bat
+@echo off
+set PYTHONPATH=%cd%
+
+
+start "Service Directory" cmd /k uvicorn service_directory.app:app --host 0.0.0.0 --port 9000
+timeout /t 2 >nul
+
+
+start "Finance API" cmd /k uvicorn finance_server.app:app --host 0.0.0.0 --port 8101
+start "Inventory API" cmd /k uvicorn inventory_server.app:app --host 0.0.0.0 --port 8102
+start "Sales API" cmd /k uvicorn sales_server.app:app --host 0.0.0.0 --port 8103
+start "Management API" cmd /k uvicorn management_server.app:app --host 0.0.0.0 --port 8104
+
+
+timeout /t 3 >nul
+
+
+start "Finance UI" cmd /k streamlit run finance_server/ui.py --server.port 8501
+start "Inventory UI" cmd /k streamlit run inventory_server/ui.py --server.port 8502
+start "Sales UI" cmd /k streamlit run sales_server/ui.py --server.port 8503
+start "Management UI" cmd /k streamlit run management_server/ui.py --server.port 8504
+
+
+
+finance_server/agents.py
+from shared.base_agent import BaseAgent
+from . import database as db
+
+
+class PaymentAgent(BaseAgent):
+    def __init__(self):
+        super().__init__(
+            "finance.payment",
+            "finance",
+            ["CHARGE_PAYMENT", "RECORD_EXPENSE", "PAYMENT_STATUS"],
+        )
+
+
+    def on_charge_payment(self, p):
+        amount = float(p["amount"])
+        if amount <= 0:
+            return {"ok": False, "error": "Nilai pembayaran harus positif."}
+        if amount > 100_000_000:
+            return {"ok": False, "error": "Pembayaran > Rp100 juta memerlukan approval manual."}
+        entry_id = db.add(
+            "revenue",
+            p.get("order_id", "SALE"),
+            amount,
+            "Payment captured by Finance PaymentAgent",
+        )
+        return {"ok": True, "entry_id": entry_id, "captured": amount}
+
+
+    def on_record_expense(self, p):
+        entry_id = db.add("expense", p.get("ref", "EXP"), p["amount"], p.get("note", ""))
+        return {"ok": True, "entry_id": entry_id}
+
+
+    def on_payment_status(self, p):
+        return {"ok": True, "policy": "Auto capture <= Rp100 juta."}
+
+
+class ProfitAgent(BaseAgent):
+    def __init__(self):
+        super().__init__("finance.profit", "finance", ["FINANCE_KPI", "PROFIT_ANALYSIS"])
+
+
+    def on_finance_kpi(self, p):
+        return {"ok": True, **db.kpis()}
+
+
+    def on_profit_analysis(self, p):
+        k = db.kpis()
+        signal = "healthy" if k["profit"] > 0 and k["margin_pct"] >= 10 else "watch"
+        return {"ok": True, "signal": signal, **k}
+
+
+class FinanceRiskAgent(BaseAgent):
+    def __init__(self):
+        super().__init__("finance.risk", "finance", ["FINANCE_RISK"])
+
+
+    def on_finance_risk(self, p):
+        k = db.kpis()
+        alerts = []
+        if k["profit"] < 0:
+            alerts.append("Profit negatif.")
+        if k["margin_pct"] < 10:
+            alerts.append("Margin di bawah 10%.")
+        return {
+            "ok": True,
+            "risk_level": "high" if alerts else "low",
+            "alerts": alerts,
+            "kpi": k,
+        }
+
+
+finance_server/app.py
+from fastapi import FastAPI, HTTPException
+from communication.message import AgentMessage
+from communication.service_directory import register_service
+from shared.config import FINANCE_URL
+from . import database as db
+from .agents import PaymentAgent, ProfitAgent, FinanceRiskAgent
+
+
+app = FastAPI(title="Finance Multi-Agent Server")
+AGENTS = {a.name: a for a in [PaymentAgent(), ProfitAgent(), FinanceRiskAgent()]}
+
+
+@app.on_event("startup")
+def startup():
+    db.init_db()
+    for agent in AGENTS.values():
+        register_service(agent.name, "finance", FINANCE_URL)
+
+
+@app.get("/")
+def home():
+    return {"department": "finance", "agents": list(AGENTS)}
+
+
+@app.get("/kpi")
+def kpi():
+    return db.kpis()
+
+
+@app.get("/ledger")
+def ledger():
+    return db.entries()
+
+
+@app.get("/agents")
+def agents():
+    return [a.status() for a in AGENTS.values()]
+
+
+@app.post("/agent/message")
+def receive_message(message: AgentMessage):
+    if message.recipient not in AGENTS:
+        raise HTTPException(404, "Finance agent tidak ditemukan.")
+    return AGENTS[message.recipient].receive(message)
+
+
+
+finance_server/database.py
+from pathlib import Path
+from shared.database import db_connect
+
+
+DB = str(Path(__file__).parent / "data" / "finance.db")
+
+
+def init_db():
+    with db_connect(DB) as db:
+        db.execute("""CREATE TABLE IF NOT EXISTS ledger(
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            kind TEXT NOT NULL,
+            ref TEXT,
+            amount REAL NOT NULL,
+            note TEXT,
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+        )""")
+        if db.execute("SELECT COUNT(*) AS n FROM ledger").fetchone()["n"] == 0:
+            db.executemany(
+                "INSERT INTO ledger(kind,ref,amount,note) VALUES(?,?,?,?)",
+                [
+                    ("revenue", "OPEN-001", 15000000, "Opening revenue"),
+                    ("cost", "OPEN-002", 8000000, "Opening cost"),
+                    ("expense", "OPEN-003", 1800000, "Operating expense"),
+                ],
+            )
+
+
+def add(kind, ref, amount, note=""):
+    with db_connect(DB) as db:
+        cur = db.execute(
+            "INSERT INTO ledger(kind,ref,amount,note) VALUES(?,?,?,?)",
+            (kind, ref, float(amount), note),
+        )
+        return cur.lastrowid
+
+
+def entries(limit=200):
+    with db_connect(DB) as db:
+        rows = db.execute("SELECT * FROM ledger ORDER BY id DESC LIMIT ?", (limit,)).fetchall()
+        return [dict(r) for r in rows]
+
+
+def kpis():
+    with db_connect(DB) as db:
+        rows = db.execute(
+            "SELECT kind, COALESCE(SUM(amount),0) total FROM ledger GROUP BY kind"
+        ).fetchall()
+    sums = {r["kind"]: float(r["total"]) for r in rows}
+    revenue = sums.get("revenue", 0)
+    cost = sums.get("cost", 0)
+    expense = sums.get("expense", 0)
+    profit = revenue - cost - expense
+    margin = (profit / revenue * 100) if revenue else 0
+    return {
+        "revenue": revenue,
+        "cost": cost,
+        "expense": expense,
+        "profit": profit,
+        "margin_pct": margin,
+    }
+
+
+finance_server/ui.py
+import streamlit as st
+import pandas as pd
+import requests
+from shared.config import FINANCE_URL
+
+
+st.set_page_config(page_title="Finance MAS", page_icon="💰", layout="wide")
+st.title("💰 Finance Department — Multi-Agent Server")
+st.caption("Agent tetap di Finance Server: PaymentAgent • ProfitAgent • FinanceRiskAgent")
+
+
+def get(path):
+    try:
+        return requests.get(FINANCE_URL + path, timeout=5).json()
+    except Exception as exc:
+        st.error(f"Finance API tidak tersedia: {exc}")
+        return {}
+
+
+k = get("/kpi")
+a,b,c,d = st.columns(4)
+a.metric("Revenue", f"Rp {k.get('revenue',0):,.0f}")
+b.metric("Cost", f"Rp {k.get('cost',0):,.0f}")
+c.metric("Profit", f"Rp {k.get('profit',0):,.0f}")
+d.metric("Margin", f"{k.get('margin_pct',0):.1f}%")
+
+
+t1,t2 = st.tabs(["📒 Ledger", "🤖 Finance Agents"])
+with t1:
+    st.dataframe(pd.DataFrame(get("/ledger")), use_container_width=True, hide_index=True)
+with t2:
+    agent = st.selectbox("Agent", ["finance.profit", "finance.risk", "finance.payment"])
+    perf = {
+        "finance.profit":"PROFIT_ANALYSIS",
+        "finance.risk":"FINANCE_RISK",
+        "finance.payment":"PAYMENT_STATUS",
+    }[agent]
+    if st.button("Jalankan Agent", type="primary"):
+        message = {"sender":"finance.ui","recipient":agent,"performative":perf,"payload":{}}
+        st.json(requests.post(FINANCE_URL+"/agent/message", json=message, timeout=10).json())
+    st.subheader("Internal Agent State")
+    st.json(get("/agents"))
+
+
+
+inventory_server/agents.py
+from shared.base_agent import BaseAgent
+from . import database as db
+
+
+class StockAgent(BaseAgent):
+    def __init__(self):
+        super().__init__(
+            "inventory.stock",
+            "inventory",
+            ["CHECK_STOCK","RESERVE_STOCK","RELEASE_STOCK","RECEIVE_STOCK","INVENTORY_KPI"],
+        )
+
+
+    def on_check_stock(self, p):
+        item = db.product(p["sku"])
+        return {"ok": bool(item), "product": item} if item else {"ok": False, "error": "SKU tidak ditemukan."}
+
+
+    def on_reserve_stock(self, p):
+        return db.change_stock(p["sku"], -int(p["qty"]), "reserve", p.get("order_id",""))
+
+
+    def on_release_stock(self, p):
+        return db.change_stock(p["sku"], int(p["qty"]), "release", p.get("order_id",""))
+
+
+    def on_receive_stock(self, p):
+        return db.change_stock(p["sku"], int(p["qty"]), "receipt", p.get("ref",""))
+
+
+    def on_inventory_kpi(self, p):
+        return {"ok": True, **db.kpis()}
+
+
+class ReorderAgent(BaseAgent):
+    def __init__(self):
+        super().__init__("inventory.reorder", "inventory", ["REORDER_SCAN"])
+
+
+    def on_reorder_scan(self, p):
+        low = []
+        for item in db.products():
+            if item["stock"] <= item["reorder_point"]:
+                low.append({
+                    "sku": item["sku"],
+                    "name": item["name"],
+                    "stock": item["stock"],
+                    "reorder_point": item["reorder_point"],
+                    "recommended_order_qty": max(item["reorder_point"]*2-item["stock"], item["reorder_point"]),
+                })
+        return {"ok": True, "count": len(low), "low_stock": low}
+
+
+class ForecastAgent(BaseAgent):
+    def __init__(self):
+        super().__init__("inventory.forecast", "inventory", ["DEMAND_FORECAST"])
+
+
+    def on_demand_forecast(self, p):
+        item = db.product(p["sku"])
+        if not item:
+            return {"ok": False, "error": "SKU tidak ditemukan."}
+        baseline = max(1, int(item["reorder_point"] * 0.7))
+        return {
+            "ok": True,
+            "sku": item["sku"],
+            "forecast_next_period": baseline,
+            "method": "rule-based baseline; replaceable with ML model",
+        }
+
+
+class WarehouseAgent(BaseAgent):
+    def __init__(self):
+        super().__init__("inventory.warehouse", "inventory", ["WAREHOUSE_STATUS"])
+
+
+    def on_warehouse_status(self, p):
+        k = db.kpis()
+        return {"ok": True, "utilization_proxy_pct": min(100, k["units_on_hand"]/5), **k}
+
+
+inventory_server/app.py
+from fastapi import FastAPI, HTTPException
+from communication.message import AgentMessage
+from communication.service_directory import register_service
+from shared.config import INVENTORY_URL
+from . import database as db
+from .agents import StockAgent, ReorderAgent, ForecastAgent, WarehouseAgent
+
+
+app = FastAPI(title="Inventory Multi-Agent Server")
+AGENTS = {a.name:a for a in [StockAgent(),ReorderAgent(),ForecastAgent(),WarehouseAgent()]}
+
+
+@app.on_event("startup")
+def startup():
+    db.init_db()
+    for agent in AGENTS.values():
+        register_service(agent.name, "inventory", INVENTORY_URL)
+
+
+@app.get("/")
+def home():
+    return {"department":"inventory","agents":list(AGENTS)}
+
+
+@app.get("/products")
+def products():
+    return db.products()
+
+
+@app.get("/kpi")
+def kpi():
+    return db.kpis()
+
+
+@app.get("/movements")
+def movements():
+    return db.movements()
+
+
+@app.get("/agents")
+def agents():
+    return [a.status() for a in AGENTS.values()]
+
+
+@app.post("/agent/message")
+def receive_message(message:AgentMessage):
+    if message.recipient not in AGENTS:
+        raise HTTPException(404,"Inventory agent tidak ditemukan.")
+    return AGENTS[message.recipient].receive(message)
+
+
+inventory_server/database.py
+from pathlib import Path
+from shared.database import db_connect
+
+
+DB = str(Path(__file__).parent / "data" / "inventory.db")
+SEED = [
+    ("SKU-001","Premium Melon A",95,20,85000,120000),
+    ("SKU-002","Premium Melon B",42,15,92000,135000),
+    ("SKU-003","Nutrient Pack",18,25,120000,175000),
+    ("SKU-004","Smart EC Sensor",12,10,325000,475000),
+    ("SKU-005","Smart pH Sensor",8,10,280000,420000),
+]
+
+
+def init_db():
+    with db_connect(DB) as db:
+        db.execute("""CREATE TABLE IF NOT EXISTS products(
+            sku TEXT PRIMARY KEY,
+            name TEXT,
+            stock INTEGER,
+            reorder_point INTEGER,
+            cost REAL,
+            sell_price REAL
+        )""")
+        if db.execute("SELECT COUNT(*) AS n FROM products").fetchone()["n"] == 0:
+            db.executemany("INSERT INTO products VALUES(?,?,?,?,?,?)", SEED)
+        db.execute("""CREATE TABLE IF NOT EXISTS stock_movements(
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            sku TEXT,
+            kind TEXT,
+            qty INTEGER,
+            ref TEXT,
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+        )""")
+
+
+def products():
+    with db_connect(DB) as db:
+        return [dict(r) for r in db.execute("SELECT * FROM products ORDER BY sku").fetchall()]
+
+
+def product(sku):
+    with db_connect(DB) as db:
+        row = db.execute("SELECT * FROM products WHERE sku=?", (sku,)).fetchone()
+        return dict(row) if row else None
+
+
+def change_stock(sku, delta, kind, ref=""):
+    with db_connect(DB) as db:
+        row = db.execute("SELECT stock FROM products WHERE sku=?", (sku,)).fetchone()
+        if not row:
+            return {"ok": False, "error": "SKU tidak ditemukan."}
+        new_stock = int(row["stock"]) + int(delta)
+        if new_stock < 0:
+            return {"ok": False, "error": "Stok tidak mencukupi.", "available": int(row["stock"])}
+        db.execute("UPDATE products SET stock=? WHERE sku=?", (new_stock, sku))
+        db.execute(
+            "INSERT INTO stock_movements(sku,kind,qty,ref) VALUES(?,?,?,?)",
+            (sku, kind, abs(int(delta)), ref),
+        )
+        return {"ok": True, "sku": sku, "new_stock": new_stock}
+
+
+def movements():
+    with db_connect(DB) as db:
+        return [dict(r) for r in db.execute(
+            "SELECT * FROM stock_movements ORDER BY id DESC LIMIT 100"
+        ).fetchall()]
+
+
+def kpis():
+    items = products()
+    return {
+        "sku_count": len(items),
+        "units_on_hand": sum(i["stock"] for i in items),
+        "low_stock_count": sum(i["stock"] <= i["reorder_point"] for i in items),
+        "inventory_value": sum(i["stock"] * i["cost"] for i in items),
+    }
+
+
+inventory_server/ui.py
+import streamlit as st
+import pandas as pd
+import requests
+from shared.config import INVENTORY_URL
+
+
+st.set_page_config(page_title="Inventory MAS", page_icon="📦", layout="wide")
+st.title("📦 Inventory Department — Multi-Agent Server")
+st.caption("StockAgent • ReorderAgent • ForecastAgent • WarehouseAgent")
+
+
+def get(path):
+    try:
+        return requests.get(INVENTORY_URL+path, timeout=5).json()
+    except Exception as exc:
+        st.error(str(exc))
+        return {}
+
+
+k=get("/kpi")
+a,b,c,d=st.columns(4)
+a.metric("SKU",k.get("sku_count",0))
+b.metric("Units on Hand",k.get("units_on_hand",0))
+c.metric("Low Stock",k.get("low_stock_count",0))
+d.metric("Inventory Value",f"Rp {k.get('inventory_value',0):,.0f}")
+
+
+t1,t2,t3=st.tabs(["📋 Stock","🤖 Inventory Agents","🧠 Agent State"])
+with t1:
+    products=get("/products")
+    st.dataframe(pd.DataFrame(products), use_container_width=True, hide_index=True)
+    if products:
+        with st.form("receive"):
+            sku=st.selectbox("SKU",[p["sku"] for p in products])
+            qty=st.number_input("Qty diterima",1,1000,10)
+            if st.form_submit_button("Receive Stock"):
+                msg={"sender":"inventory.ui","recipient":"inventory.stock","performative":"RECEIVE_STOCK",
+                     "payload":{"sku":sku,"qty":qty,"ref":"MANUAL-RECEIPT"}}
+                st.json(requests.post(INVENTORY_URL+"/agent/message", json=msg, timeout=10).json())
+    st.subheader("Stock Movements")
+    st.dataframe(pd.DataFrame(get("/movements")), use_container_width=True, hide_index=True)
+
+
+with t2:
+    if st.button("Run ReorderAgent", type="primary"):
+        msg={"sender":"inventory.ui","recipient":"inventory.reorder","performative":"REORDER_SCAN","payload":{}}
+        st.json(requests.post(INVENTORY_URL+"/agent/message",json=msg,timeout=10).json())
+    sku_f=st.text_input("SKU Forecast","SKU-001")
+    if st.button("Run ForecastAgent"):
+        msg={"sender":"inventory.ui","recipient":"inventory.forecast","performative":"DEMAND_FORECAST","payload":{"sku":sku_f}}
+        st.json(requests.post(INVENTORY_URL+"/agent/message",json=msg,timeout=10).json())
+
+
+with t3:
+    st.json(get("/agents"))
+
+
+sales_server/agents.py
+from uuid import uuid4
+import requests
+from shared.base_agent import BaseAgent
+from shared.config import INVENTORY_URL
+from . import database as db
+
+
+class CatalogAgent(BaseAgent):
+    def __init__(self):
+        super().__init__("sales.catalog","sales",["CATALOG"])
+
+
+    def on_catalog(self,p):
+        try:
+            products=requests.get(INVENTORY_URL+"/products",timeout=5).json()
+            return {"ok":True,"products":[x for x in products if x["stock"]>0]}
+        except Exception as exc:
+            return {"ok":False,"error":str(exc)}
+
+
+class PricingAgent(BaseAgent):
+    def __init__(self):
+        super().__init__("sales.pricing","sales",["PRICE_RECOMMENDATION"])
+
+
+    def on_price_recommendation(self,p):
+        cost=float(p["cost"])
+        current=float(p["current_price"])
+        stock=int(p["stock"])
+        reorder=int(p["reorder_point"])
+        min_margin=float(p.get("min_margin_pct",25))/100
+        floor=cost*(1+min_margin)
+        scarcity_factor=1.08 if stock<=reorder else 1.0
+        recommended=max(floor,current*scarcity_factor)
+        return {
+            "ok":True,
+            "recommended_price":round(recommended,2),
+            "minimum_floor":round(floor,2),
+            "reason":"stock scarcity uplift" if scarcity_factor>1 else "normal stock policy",
+        }
+
+
+class CustomerAgent(BaseAgent):
+    def __init__(self):
+        super().__init__("sales.customer","sales",["CUSTOMER_SEGMENT"])
+
+
+    def on_customer_segment(self,p):
+        total=float(p.get("lifetime_value",0))
+        if total>=10_000_000:
+            segment="VIP"
+        elif total>=2_000_000:
+            segment="Loyal"
+        else:
+            segment="Standard"
+        return {"ok":True,"segment":segment}
+
+
+class OrderAgent(BaseAgent):
+    def __init__(self):
+        super().__init__("sales.order","sales",["CREATE_SALE","SALES_KPI"])
+
+
+    def on_create_sale(self,p):
+        order_id=p.get("order_id") or f"ORD-{uuid4().hex[:8].upper()}"
+        sku=p["sku"]
+        qty=int(p["qty"])
+        unit_price=float(p["unit_price"])
+        total=qty*unit_price
+
+
+        reserve=self.communicate(
+            "inventory.stock",
+            "RESERVE_STOCK",
+            {"sku":sku,"qty":qty,"order_id":order_id},
+        )
+        reserve_data=reserve.get("data",{}) if isinstance(reserve,dict) else {}
+        if not reserve.get("ok",False) or not reserve_data.get("ok",False):
+            return {"ok":False,"error":"Reserve stock gagal.","stage":"inventory","detail":reserve}
+
+
+        payment=self.communicate(
+            "finance.payment",
+            "CHARGE_PAYMENT",
+            {"order_id":order_id,"amount":total,"customer":p.get("customer","Walk-in")},
+        )
+        payment_data=payment.get("data",{}) if isinstance(payment,dict) else {}
+        if not payment.get("ok",False) or not payment_data.get("ok",False):
+            self.communicate(
+                "inventory.stock",
+                "RELEASE_STOCK",
+                {"sku":sku,"qty":qty,"order_id":order_id},
+            )
+            return {"ok":False,"error":"Payment gagal; stock reservation dibatalkan.","stage":"finance","detail":payment}
+
+
+        db.add_order(order_id,sku,qty,unit_price,total,p.get("customer","Walk-in"),"paid")
+        return {
+            "ok":True,
+            "order_id":order_id,
+            "sku":sku,
+            "qty":qty,
+            "unit_price":unit_price,
+            "total":total,
+            "inventory_confirmation":reserve_data,
+            "payment_confirmation":payment_data,
+        }
+
+
+    def on_sales_kpi(self,p):
+        return {"ok":True,**db.kpis()}
+
+
+sales_server/app.py
+from fastapi import FastAPI, HTTPException
+from communication.message import AgentMessage
+from communication.service_directory import register_service
+from shared.config import SALES_URL
+from . import database as db
+from .agents import CatalogAgent, PricingAgent, CustomerAgent, OrderAgent
+
+
+app=FastAPI(title="Sales Multi-Agent Server")
+AGENTS={a.name:a for a in [CatalogAgent(),PricingAgent(),CustomerAgent(),OrderAgent()]}
+
+
+@app.on_event("startup")
+def startup():
+    db.init_db()
+    for agent in AGENTS.values():
+        register_service(agent.name,"sales",SALES_URL)
+
+
+@app.get("/")
+def home():
+    return {"department":"sales","agents":list(AGENTS)}
+
+
+@app.get("/orders")
+def orders():
+    return db.orders()
+
+
+@app.get("/kpi")
+def kpi():
+    return db.kpis()
+
+
+@app.get("/agents")
+def agents():
+    return [a.status() for a in AGENTS.values()]
+
+
+@app.post("/agent/message")
+def receive_message(message:AgentMessage):
+    if message.recipient not in AGENTS:
+        raise HTTPException(404,"Sales agent tidak ditemukan.")
+    return AGENTS[message.recipient].receive(message)
+
+
+
+sales_server/database.py
+from pathlib import Path
+from shared.database import db_connect
+
+
+DB = str(Path(__file__).parent / "data" / "sales.db")
+
+
+def init_db():
+    with db_connect(DB) as db:
+        db.execute("""CREATE TABLE IF NOT EXISTS orders(
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            order_id TEXT UNIQUE,
+            sku TEXT,
+            qty INTEGER,
+            unit_price REAL,
+            total REAL,
+            customer TEXT,
+            status TEXT,
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+        )""")
+
+
+def add_order(order_id, sku, qty, unit_price, total, customer, status):
+    with db_connect(DB) as db:
+        db.execute(
+            """INSERT INTO orders(order_id,sku,qty,unit_price,total,customer,status)
+               VALUES(?,?,?,?,?,?,?)""",
+            (order_id,sku,qty,unit_price,total,customer,status),
+        )
+
+
+def orders():
+    with db_connect(DB) as db:
+        return [dict(r) for r in db.execute("SELECT * FROM orders ORDER BY id DESC").fetchall()]
+
+
+def kpis():
+    with db_connect(DB) as db:
+        row=db.execute("""SELECT COUNT(*) orders_count,
+                                COALESCE(SUM(qty),0) units_sold,
+                                COALESCE(SUM(total),0) gross_sales
+                         FROM orders WHERE status='paid'""").fetchone()
+        return dict(row)
+
+
+
+sales_server/ui.py
+import streamlit as st
+import pandas as pd
+import requests
+from shared.config import SALES_URL, INVENTORY_URL
+
+
+st.set_page_config(page_title="Sales MAS", page_icon="🛒", layout="wide")
+st.title("🛒 Sales Department — Multi-Agent Server")
+st.caption("OrderAgent • PricingAgent • CatalogAgent • CustomerAgent")
+
+
+def get(url):
+    try:
+        return requests.get(url, timeout=5).json()
+    except Exception as exc:
+        st.error(str(exc))
+        return {}
+
+
+k=get(SALES_URL+"/kpi")
+a,b,c=st.columns(3)
+a.metric("Paid Orders",k.get("orders_count",0))
+b.metric("Units Sold",k.get("units_sold",0))
+c.metric("Gross Sales",f"Rp {k.get('gross_sales',0):,.0f}")
+
+
+products=get(INVENTORY_URL+"/products") or []
+t1,t2,t3=st.tabs(["🛍️ Penjualan","🏷️ Pricing Agent","🧠 Orders & Agents"])
+
+
+with t1:
+    if products:
+        sku=st.selectbox("Produk",[p["sku"] for p in products],
+                         format_func=lambda s: next(f"{p['sku']} — {p['name']} | stock {p['stock']}" for p in products if p["sku"]==s))
+        item=next(p for p in products if p["sku"]==sku)
+        c1,c2,c3=st.columns(3)
+        qty=c1.number_input("Qty",1,max(1,int(item["stock"])),1)
+        price=c2.number_input("Unit Price",0.0,value=float(item["sell_price"]),step=1000.0)
+        customer=c3.text_input("Customer","Customer Demo")
+        st.info(f"Total transaksi: Rp {qty*price:,.0f}")
+        if st.button("Execute Multi-Agent Sale",type="primary",use_container_width=True):
+            msg={"sender":"sales.ui","recipient":"sales.order","performative":"CREATE_SALE",
+                 "payload":{"sku":sku,"qty":qty,"unit_price":price,"customer":customer}}
+            result=requests.post(SALES_URL+"/agent/message",json=msg,timeout=20).json()
+            st.json(result)
+    else:
+        st.warning("Data Inventory belum tersedia.")
+
+
+with t2:
+    if products:
+        sku2=st.selectbox("SKU",[p["sku"] for p in products],key="pricing")
+        item=next(p for p in products if p["sku"]==sku2)
+        if st.button("Ask PricingAgent"):
+            msg={"sender":"sales.ui","recipient":"sales.pricing","performative":"PRICE_RECOMMENDATION",
+                 "payload":{"cost":item["cost"],"current_price":item["sell_price"],"stock":item["stock"],
+                            "reorder_point":item["reorder_point"],"min_margin_pct":25}}
+            st.json(requests.post(SALES_URL+"/agent/message",json=msg,timeout=10).json())
+
+
+with t3:
+    st.dataframe(pd.DataFrame(get(SALES_URL+"/orders")),use_container_width=True,hide_index=True)
+    st.subheader("Internal Agent State")
+    st.json(get(SALES_URL+"/agents"))
+
+
+
+management_server/agents.py
+import requests
+from shared.base_agent import BaseAgent
+from shared.config import FINANCE_URL, INVENTORY_URL, SALES_URL
+
+
+def safe_get(url):
+    try:
+        return requests.get(url,timeout=5).json()
+    except Exception as exc:
+        return {"error":str(exc)}
+
+
+class ExecutiveAgent(BaseAgent):
+    def __init__(self):
+        super().__init__("management.executive","management",["ENTERPRISE_KPI","EXECUTIVE_BRIEFING"])
+
+
+    def on_enterprise_kpi(self,p):
+        return {
+            "ok":True,
+            "finance":safe_get(FINANCE_URL+"/kpi"),
+            "inventory":safe_get(INVENTORY_URL+"/kpi"),
+            "sales":safe_get(SALES_URL+"/kpi"),
+        }
+
+
+    def on_executive_briefing(self,p):
+        fin=safe_get(FINANCE_URL+"/kpi")
+        inv=safe_get(INVENTORY_URL+"/kpi")
+        sales=safe_get(SALES_URL+"/kpi")
+        briefing=[]
+        briefing.append("Company profitable." if fin.get("profit",0)>0 else "Profit membutuhkan perhatian.")
+        if inv.get("low_stock_count",0)>0:
+            briefing.append(f"{inv['low_stock_count']} SKU berada pada kondisi low stock.")
+        briefing.append(f"Paid orders tercatat: {sales.get('orders_count',0)}.")
+        return {"ok":True,"briefing":briefing,"finance":fin,"inventory":inv,"sales":sales}
+
+
+class EnterpriseRiskAgent(BaseAgent):
+    def __init__(self):
+        super().__init__("management.risk","management",["ENTERPRISE_RISK"])
+
+
+    def on_enterprise_risk(self,p):
+        fin=safe_get(FINANCE_URL+"/kpi")
+        inv=safe_get(INVENTORY_URL+"/kpi")
+        alerts=[]
+        if fin.get("margin_pct",100)<10:
+            alerts.append({"domain":"finance","severity":"high","text":"Margin di bawah 10%."})
+        if inv.get("low_stock_count",0)>0:
+            alerts.append({"domain":"inventory","severity":"medium","text":"Low-stock SKU terdeteksi."})
+        return {"ok":True,"risk_score":len(alerts),"alerts":alerts}
+
+
+class StrategyAgent(BaseAgent):
+    def __init__(self):
+        super().__init__("management.strategy","management",["STRATEGY_ACTIONS"])
+
+
+    def on_strategy_actions(self,p):
+        inv=safe_get(INVENTORY_URL+"/kpi")
+        fin=safe_get(FINANCE_URL+"/kpi")
+        actions=[]
+        if inv.get("low_stock_count",0)>0:
+            actions.append("Prioritaskan replenishment untuk SKU low-stock.")
+        if fin.get("margin_pct",0)<20:
+            actions.append("Review pricing dan operating cost untuk meningkatkan margin.")
+        if not actions:
+            actions.append("Pertahankan kebijakan operasi saat ini dan monitor KPI.")
+        return {"ok":True,"recommended_actions":actions}
+
+
+
+management_server/app.py
+from fastapi import FastAPI, HTTPException
+from communication.message import AgentMessage
+from communication.service_directory import register_service
+from shared.config import MANAGEMENT_URL
+from .agents import ExecutiveAgent, EnterpriseRiskAgent, StrategyAgent
+
+
+app=FastAPI(title="Management / Board Multi-Agent Server")
+AGENTS={a.name:a for a in [ExecutiveAgent(),EnterpriseRiskAgent(),StrategyAgent()]}
+
+
+@app.on_event("startup")
+def startup():
+    for agent in AGENTS.values():
+        register_service(agent.name,"management",MANAGEMENT_URL)
+
+
+@app.get("/")
+def home():
+    return {"department":"management","agents":list(AGENTS)}
+
+
+@app.get("/agents")
+def agents():
+    return [a.status() for a in AGENTS.values()]
+
+
+@app.post("/agent/message")
+def receive_message(message:AgentMessage):
+    if message.recipient not in AGENTS:
+        raise HTTPException(404,"Management agent tidak ditemukan.")
+    return AGENTS[message.recipient].receive(message)
+
+
+management_server/ui.py
+import streamlit as st
+import requests
+import pandas as pd
+from shared.config import MANAGEMENT_URL, FINANCE_URL, INVENTORY_URL, SALES_URL, DIRECTORY_URL
+
+
+st.set_page_config(page_title="Board MAS", page_icon="🏢", layout="wide")
+st.title("🏢 Board of Directors — Multi-Agent Enterprise Cockpit")
+st.caption("ExecutiveAgent • EnterpriseRiskAgent • StrategyAgent")
+
+
+def get(url):
+    try:
+        return requests.get(url,timeout=5).json()
+    except Exception:
+        return {}
+
+
+fin=get(FINANCE_URL+"/kpi")
+inv=get(INVENTORY_URL+"/kpi")
+sales=get(SALES_URL+"/kpi")
+
+
+a,b,c,d=st.columns(4)
+a.metric("Profit",f"Rp {fin.get('profit',0):,.0f}")
+b.metric("Margin",f"{fin.get('margin_pct',0):.1f}%")
+c.metric("Low Stock",inv.get("low_stock_count",0))
+d.metric("Paid Orders",sales.get("orders_count",0))
+
+
+t1,t2,t3,t4=st.tabs(["📊 Executive","⚠️ Risk","🧭 Strategy","🌐 Agent Directory"])
+
+
+with t1:
+    if st.button("Generate Executive Briefing",type="primary"):
+        msg={"sender":"management.ui","recipient":"management.executive","performative":"EXECUTIVE_BRIEFING","payload":{}}
+        result=requests.post(MANAGEMENT_URL+"/agent/message",json=msg,timeout=15).json()
+        for line in result.get("data",{}).get("briefing",[]):
+            st.write("•",line)
+        st.json(result)
+
+
+with t2:
+    if st.button("Run EnterpriseRiskAgent"):
+        msg={"sender":"management.ui","recipient":"management.risk","performative":"ENTERPRISE_RISK","payload":{}}
+        st.json(requests.post(MANAGEMENT_URL+"/agent/message",json=msg,timeout=15).json())
+
+
+with t3:
+    if st.button("Run StrategyAgent"):
+        msg={"sender":"management.ui","recipient":"management.strategy","performative":"STRATEGY_ACTIONS","payload":{}}
+        st.json(requests.post(MANAGEMENT_URL+"/agent/message",json=msg,timeout=15).json())
+
+
+with t4:
+    directory=get(DIRECTORY_URL+"/agents")
+    if directory:
+        st.dataframe(pd.DataFrame(directory),use_container_width=True,hide_index=True)
+    else:
+        st.warning("Service Directory belum berisi agent.")
+    st.subheader("Management Agent State")
+    st.json(get(MANAGEMENT_URL+"/agents"))
+
+
+
+
+communication/message_bus.py
+from typing import Any, Dict
+import requests
+from .service_directory import discover_service
+
+
+def send_message(message: Dict[str, Any]) -> Dict[str, Any]:
+    target = discover_service(message["recipient"])
+    if target is None:
+        return {
+            "ok": False,
+            "error": f"Recipient {message['recipient']} tidak ditemukan pada Service Directory.",
+        }
+
+
+    try:
+        response = requests.post(
+            f"{target['base_url']}/agent/message",
+            json=message,
+            timeout=15,
+        )
+        return response.json()
+    except Exception as exc:
+        return {"ok": False, "error": str(exc)}
+
+
+
+communication/message.py
+from typing import Any, Dict
+from pydantic import BaseModel, Field
+from uuid import uuid4
+from datetime import datetime, timezone
+
+
+class AgentMessage(BaseModel):
+    message_id: str = Field(default_factory=lambda: str(uuid4()))
+    sender: str
+    recipient: str
+    performative: str
+    payload: Dict[str, Any] = Field(default_factory=dict)
+    conversation_id: str = Field(default_factory=lambda: str(uuid4()))
+    created_at: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
+
+
+communication/service_directory.py
+from typing import Any, Dict, Optional
+import requests
+from shared.config import DIRECTORY_URL
+
+
+def register_service(agent_name: str, department: str, base_url: str) -> Dict[str, Any]:
+    try:
+        response = requests.post(
+            f"{DIRECTORY_URL}/register",
+            json={
+                "agent_name": agent_name,
+                "department": department,
+                "base_url": base_url,
+            },
+            timeout=3,
+        )
+        return response.json()
+    except Exception as exc:
+        return {"ok": False, "error": str(exc)}
+
+
+def discover_service(agent_name: str) -> Optional[Dict[str, Any]]:
+    try:
+        response = requests.get(f"{DIRECTORY_URL}/agents/{agent_name}", timeout=3)
+        if response.ok:
+            return response.json()
+    except Exception:
+        return None
+    return None
+
+
+
+service_directory/app.py
+from datetime import datetime, timezone
+from typing import Dict
+from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel
+
+
+app = FastAPI(title="Enterprise Agent Service Directory", version="1.0")
+
+
+class ServiceRegistration(BaseModel):
+    agent_name: str
+    department: str
+    base_url: str
+
+
+DIRECTORY: Dict[str, dict] = {}
+
+
+@app.get("/")
+def home():
+    return {
+        "service": "agent-service-directory",
+        "registered_agents": len(DIRECTORY),
+        "note": "Directory untuk endpoint komunikasi. Bukan registry untuk migrasi agent.",
+    }
+
+
+@app.post("/register")
+def register(item: ServiceRegistration):
+    DIRECTORY[item.agent_name] = {
+        "agent_name": item.agent_name,
+        "department": item.department,
+        "base_url": item.base_url.rstrip("/"),
+        "registered_at": datetime.now(timezone.utc).isoformat(),
+    }
+    return {"ok": True, **DIRECTORY[item.agent_name]}
+
+
+@app.get("/agents")
+def agents():
+    return list(DIRECTORY.values())
+
+
+@app.get("/agents/{agent_name}")
+def agent(agent_name: str):
+    if agent_name not in DIRECTORY:
+        raise HTTPException(404, "Agent service tidak ditemukan")
+    return DIRECTORY[agent_name]
+
+
+
+shared/base_agent.py
+from collections import deque
+from datetime import datetime, timezone
+from typing import Any, Dict, List
+from communication.message import AgentMessage
+from communication.message_bus import send_message
+
+
+class BaseAgent:
+    """
+    Agent tetap (stationary agent) pada server departemennya.
+    Kelas ini tidak mempunyai kemampuan migrasi host.
+    """
+
+
+    def __init__(self, name: str, department: str, capabilities: List[str]):
+        self.name = name
+        self.department = department
+        self.capabilities = capabilities
+        self.beliefs: Dict[str, Any] = {}
+        self.goals: List[str] = []
+        self.intentions: List[str] = []
+        self.memory = deque(maxlen=200)
+
+
+    def perceive(self, event: Dict[str, Any]) -> Dict[str, Any]:
+        perception = {
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "event": event,
+        }
+        self.memory.append({"phase": "perception", **perception})
+        return perception
+
+
+    def update_belief(self, perception: Dict[str, Any]) -> None:
+        self.beliefs["last_perception"] = perception
+        self.beliefs["updated_at"] = datetime.now(timezone.utc).isoformat()
+
+
+    def select_goal(self, performative: str, payload: Dict[str, Any]) -> str:
+        goal = f"complete::{performative}"
+        self.goals.append(goal)
+        return goal
+
+
+    def form_intention(self, goal: str) -> str:
+        intention = f"commit::{goal}"
+        self.intentions.append(intention)
+        return intention
+
+
+    def create_plan(self, performative: str, payload: Dict[str, Any]) -> List[Dict[str, Any]]:
+        return [
+            {
+                "step": 1,
+                "name": "reason",
+                "action": "reason",
+                "status": "pending",
+                "input": {"performative": performative, "payload": payload},
+            },
+            {
+                "step": 2,
+                "name": "act",
+                "action": performative,
+                "status": "pending",
+                "input": payload,
+            },
+        ]
+
+
+    def reason(self, performative: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+        allowed = performative in self.capabilities
+        return {
+            "allowed": allowed,
+            "decision": "execute" if allowed else "reject",
+            "matched_capability": performative if allowed else None,
+        }
+
+
+    def act(self, performative: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+        handler = getattr(self, f"on_{performative.lower()}", None)
+        if handler is None:
+            return {
+                "ok": False,
+                "error": f"{self.name} tidak mempunyai capability {performative}",
+            }
+        return handler(payload)
+
+
+    def communicate(self, recipient: str, performative: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+        message = AgentMessage(
+            sender=self.name,
+            recipient=recipient,
+            performative=performative,
+            payload=payload,
+        )
+        self.memory.append({"phase": "communication", "direction": "out", "message": message.model_dump()})
+        return send_message(message.model_dump())
+
+
+    def reflect(self, result: Dict[str, Any]) -> str:
+        if result.get("ok", False):
+            text = "Aksi berhasil; belief diperbarui dari hasil eksekusi."
+        else:
+            text = f"Aksi gagal; agent perlu revisi plan atau menjalankan compensation action. Penyebab: {result.get('error', 'unknown')}"
+        self.memory.append({"phase": "reflection", "text": text})
+        return text
+
+
+    def receive(self, message: AgentMessage) -> Dict[str, Any]:
+        perception = self.perceive(message.model_dump())
+        self.update_belief(perception)
+
+
+        goal = self.select_goal(message.performative, message.payload)
+        intention = self.form_intention(goal)
+        plan = self.create_plan(message.performative, message.payload)
+
+
+        reasoning = self.reason(message.performative, message.payload)
+        plan[0]["status"] = "done"
+        plan[0]["result"] = reasoning
+
+
+        if not reasoning["allowed"]:
+            result = {"ok": False, "error": "Capability tidak diizinkan."}
+        else:
+            result = self.act(message.performative, message.payload)
+
+
+        plan[1]["status"] = "done" if result.get("ok", False) else "failed"
+        plan[1]["result"] = result
+
+
+        reflection = self.reflect(result)
+        self.beliefs["last_result"] = result
+
+
+        return {
+            "ok": result.get("ok", False),
+            "agent": self.name,
+            "department": self.department,
+            "goal": goal,
+            "intention": intention,
+            "plan": plan,
+            "data": result,
+            "reflection": reflection,
+        }
+
+
+    def status(self) -> Dict[str, Any]:
+        return {
+            "name": self.name,
+            "department": self.department,
+            "capabilities": self.capabilities,
+            "beliefs": self.beliefs,
+            "goals": self.goals[-10:],
+            "intentions": self.intentions[-10:],
+            "memory_size": len(self.memory),
+            "memory_tail": list(self.memory)[-10:],
+            "mobility": "disabled / not implemented",
+        }
+
+
+
+
+shared/config.py
+import os
+
+
+DIRECTORY_URL = os.getenv("DIRECTORY_URL", "http://127.0.0.1:9000")
+FINANCE_URL = os.getenv("FINANCE_URL", "http://127.0.0.1:8101")
+INVENTORY_URL = os.getenv("INVENTORY_URL", "http://127.0.0.1:8102")
+SALES_URL = os.getenv("SALES_URL", "http://127.0.0.1:8103")
+MANAGEMENT_URL = os.getenv("MANAGEMENT_URL", "http://127.0.0.1:8104")
+
+
+
+
+shared/database.py
+import sqlite3
+from contextlib import contextmanager
+from pathlib import Path
+
+
+@contextmanager
+def db_connect(path: str):
+    Path(path).parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(path, check_same_thread=False)
+    conn.row_factory = sqlite3.Row
+    try:
+        yield conn
+        conn.commit()
+    finally:
+        conn.close()
+
+
+
+
+
+Cara Menjalankan:
+Masuk ke enterprise_multi_agent_system lewat terminal:
+cd enterprise_multi_agent_system
+
+Jalankan aplikasi:
+Windows:
+.\start_all_windows.bat
+
+Linux:
+start_all_linux.sh
+
+
