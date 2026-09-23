@@ -1,0 +1,314 @@
+Program Streamlit
+ 
+
+Struktur Folder & File
+Buat susunan folder seperti ini:
+
+drone_swarm_simulator/
+├── requirements.txt
+├── app.py
+└── core/
+	├── __init__.py
+	├── text_sampler.py
+	├── assignment.py
+	└── trajectory.py
+
+
+Isi Masing-Masing File
+1. requirements.txt
+Letakkan di root folder:
+
+streamlit>=1.30.0
+numpy>=1.24.0
+scipy>=1.11.0
+plotly>=5.18.0
+pillow>=10.0.0
+pandas>=2.1.0
+
+
+
+2. core/__init__.py
+Buat folder core/, lalu buat file kosong ini di dalamnya:
+
+Python
+# Inisialisasi package core
+
+
+
+3. core/text_sampler.py
+File ini bertugas mengonversi teks input menjadi  titik target koordinat :
+
+import numpy as np
+from PIL import Image, ImageDraw, ImageFont
+
+
+def generate_text_targets(text: str, n_drones: int, canvas_width: int = 800, canvas_height: int = 300) -> np.ndarray:
+    """
+    Me-render teks ke kanvas 2D dan mengekstrak N titik target koordinat di udara.
+    """
+    if not text.strip():
+        text = "UGM"
+
+
+    # Buat kanvas biner (hitam-putih)
+    img = Image.new("1", (canvas_width, canvas_height), 0)
+    draw = ImageDraw.Draw(img)
+    font = ImageFont.load_default()
+   
+    # Hitung batas dimensi teks
+    bbox = draw.textbbox((0, 0), text, font=font)
+    text_w, text_h = bbox[2] - bbox[0], bbox[3] - bbox[1]
+   
+    # Skala proporsional agar mengisi kanvas
+    scale = min((canvas_width * 0.75) / max(text_w, 1), (canvas_height * 0.65) / max(text_h, 1))
+    scale_w = int(max(text_w * scale, 10))
+    scale_h = int(max(text_h * scale, 10))
+   
+    img_temp = Image.new("1", (max(text_w, 1), max(text_h, 1)), 0)
+    draw_temp = ImageDraw.Draw(img_temp)
+    draw_temp.text((-bbox[0], -bbox[1]), text, fill=1, font=font)
+   
+    img_resized = img_temp.resize((scale_w, scale_h), Image.Resampling.NEAREST)
+    offset_x = (canvas_width - scale_w) // 2
+    offset_y = (canvas_height - scale_h) // 2
+    img.paste(img_resized, (offset_x, offset_y))
+   
+    # Ekstrak piksel teks yang menyala
+    pixels = np.array(img)
+    y_coords, x_coords = np.where(pixels > 0)
+   
+    if len(x_coords) == 0:
+        x_coords = np.random.uniform(0, canvas_width, n_drones)
+        y_coords = np.random.uniform(0, canvas_height, n_drones)
+   
+    # Sampling tepat N titik
+    indices = np.random.choice(len(x_coords), size=n_drones, replace=(len(x_coords) < n_drones))
+   
+    # Konversi koordinat piksel ke satuan meter di udara
+    target_x = ((x_coords[indices].astype(float) / canvas_width) - 0.5) * 200.0
+    target_z = 30.0 + ((canvas_height - y_coords[indices]).astype(float) / canvas_height) * 60.0
+    target_y = np.zeros(n_drones)  # Kanvas 2D display di y = 0
+   
+    return np.column_stack((target_x, target_y, target_z))
+
+
+
+4. core/assignment.py
+File ini berisi algoritma pencocokan optimal (Hungarian / Linear Sum Assignment):
+
+import numpy as np
+from scipy.optimize import linear_sum_assignment
+
+
+def solve_optimal_assignment(current_positions: np.ndarray, target_positions: np.ndarray) -> np.ndarray:
+    """
+    Menyelesaikan penugasan 1-ke-1 meminimalkan total kuadrat jarak tempuh drone.
+    """
+    cost_matrix = np.sum((current_positions[:, np.newaxis, :] - target_positions[np.newaxis, :, :]) ** 2, axis=2)
+    _, col_ind = linear_sum_assignment(cost_matrix)
+    return target_positions[col_ind]
+
+
+
+
+
+
+5. core/trajectory.py
+File ini menghitung lintasan interpolasi frame dan telemetri statistik:
+
+import numpy as np
+import pandas as pd
+
+
+def compute_interpolated_frames(start_pos: np.ndarray, target_pos: np.ndarray, n_steps: int = 12) -> list:
+    """
+    Menghasilkan langkah posisi frame transisi menggunakan interpolasi Cosine (S-Curve)
+    dengan pemisahan koridor kedalaman (sumbu Y) untuk menghindari tabrakan.
+    """
+    frames = []
+    n_drones = len(start_pos)
+    y_corridor = np.sin(np.linspace(0, np.pi, n_drones)) * 15.0
+   
+    for step in range(n_steps + 1):
+        progress = step / n_steps
+        s = 0.5 * (1 - np.cos(np.pi * progress))
+       
+        curr_x = (1 - s) * start_pos[:, 0] + s * target_pos[:, 0]
+        curr_z = (1 - s) * start_pos[:, 2] + s * target_pos[:, 2]
+        curr_y = (1 - s) * start_pos[:, 1] + s * target_pos[:, 1] + (y_corridor * np.sin(np.pi * progress))
+       
+        frames.append(np.column_stack((curr_x, curr_y, curr_z)))
+    return frames
+
+
+def generate_swarm_telemetry(n_drones: int, start_pos: np.ndarray, target_pos: np.ndarray) -> pd.DataFrame:
+    """
+    Menghitung statistik telemetri operasional per drone.
+    """
+    distances = np.linalg.norm(target_pos - start_pos, axis=1)
+    energy_used = 3.5 + (distances * 0.08)
+   
+    return pd.DataFrame({
+        "Drone_ID": [f"DRN-{i+1:04d}" for i in range(n_drones)],
+        "Distance_m": np.round(distances, 2),
+        "Est_Battery_Loss_%": np.round(energy_used, 2),
+        "Target_X": np.round(target_pos[:, 0], 2),
+        "Target_Y": np.round(target_pos[:, 1], 2),
+        "Target_Z": np.round(target_pos[:, 2], 2),
+        "Status": ["Ready / Locked"] * n_drones
+    })
+   
+
+
+
+
+6. app.py
+File utama antarmuka pengguna Streamlit (di root folder):
+
+
+
+
+import streamlit as st
+import numpy as np
+import plotly.graph_objects as go
+import time
+
+
+from core.text_sampler import generate_text_targets
+from core.assignment import solve_optimal_assignment
+from core.trajectory import compute_interpolated_frames, generate_swarm_telemetry
+
+
+st.set_page_config(page_title="Swarm Formation Studio", layout="wide")
+
+
+# State Aplikasi
+if "n_drones" not in st.session_state:
+    st.session_state.n_drones = 1000
+if "positions" not in st.session_state:
+    side = int(np.ceil(np.sqrt(st.session_state.n_drones)))
+    gx, gy = np.meshgrid(np.linspace(-40, 40, side), np.linspace(-40, 40, side))
+    st.session_state.positions = np.column_stack((gx.ravel()[:st.session_state.n_drones], gy.ravel()[:st.session_state.n_drones], np.zeros(st.session_state.n_drones)))
+if "telemetry_df" not in st.session_state:
+    st.session_state.telemetry_df = None
+if "current_pattern" not in st.session_state:
+    st.session_state.current_pattern = "Launchpad (Ground)"
+
+
+# Sidebar Menu
+with st.sidebar:
+    st.title("Swarm Control Unit")
+    st.markdown("---")
+   
+    n_input = st.selectbox("Jumlah Drone (N)", options=[500, 1000, 1500, 2000], index=1)
+    if n_input != st.session_state.n_drones:
+        st.session_state.n_drones = n_input
+        side = int(np.ceil(np.sqrt(n_input)))
+        gx, gy = np.meshgrid(np.linspace(-50, 50, side), np.linspace(-50, 50, side))
+        st.session_state.positions = np.column_stack((gx.ravel()[:n_input], gy.ravel()[:n_input], np.zeros(n_input)))
+        st.session_state.telemetry_df = None
+        st.session_state.current_pattern = "Launchpad (Ground)"
+        st.rerun()
+
+
+    text_input = st.text_input("Teks Formasi", value="UGM Yogyakarta")
+   
+    col1, col2 = st.columns(2)
+    with col1:
+        form_btn = st.button("Bentuk Teks", use_container_width=True)
+    with col2:
+        reset_btn = st.button("Reset Ground", use_container_width=True)
+       
+    st.markdown("---")
+    show_stats = st.checkbox("Tampilkan Detail Statistik", value=True)
+
+
+# Render Plot Visualisasi
+def build_scatter_plot(points: np.ndarray, title: str):
+    fig = go.Figure(data=[go.Scatter3d(
+        x=points[:, 0], y=points[:, 1], z=points[:, 2],
+        mode='markers',
+        marker=dict(size=3, color=points[:, 2], colorscale='Viridis', opacity=0.9),
+        text=[f"ID: DRN-{i+1:04d}" for i in range(len(points))],
+        hoverinfo="text+x+y+z"
+    )])
+    fig.update_layout(
+        title=f"<b>Visualisasi Formasi Swarm</b> — {title}",
+        scene=dict(
+            xaxis=dict(range=[-110, 110], title="X (m)"),
+            yaxis=dict(range=[-60, 60], title="Y (m)"),
+            zaxis=dict(range=[-5, 105], title="Z (m)"),
+            aspectratio=dict(x=2.2, y=1.2, z=1.0),
+            bgcolor="#0E1117"
+        ),
+        margin=dict(l=0, r=0, b=0, t=40),
+        template="plotly_dark",
+        height=550
+    )
+    return fig
+
+
+main_canvas = st.empty()
+
+
+if reset_btn:
+    side = int(np.ceil(np.sqrt(st.session_state.n_drones)))
+    gx, gy = np.meshgrid(np.linspace(-40, 40, side), np.linspace(-40, 40, side))
+    st.session_state.positions = np.column_stack((gx.ravel()[:st.session_state.n_drones], gy.ravel()[:st.session_state.n_drones], np.zeros(st.session_state.n_drones)))
+    st.session_state.telemetry_df = None
+    st.session_state.current_pattern = "Launchpad (Ground)"
+    st.rerun()
+
+
+if form_btn:
+    raw_targets = generate_text_targets(text_input, st.session_state.n_drones)
+    assigned_targets = solve_optimal_assignment(st.session_state.positions, raw_targets)
+    frames = compute_interpolated_frames(st.session_state.positions, assigned_targets, n_steps=12)
+    st.session_state.telemetry_df = generate_swarm_telemetry(st.session_state.n_drones, st.session_state.positions, assigned_targets)
+   
+    prog = st.progress(0)
+    for idx, frame in enumerate(frames):
+        prog.progress(int(((idx + 1) / len(frames)) * 100))
+        fig = build_scatter_plot(frame, title=f"Manuver: '{text_input}'")
+        main_canvas.plotly_chart(fig, use_container_width=True)
+        time.sleep(0.04)
+       
+    st.session_state.positions = assigned_targets
+    st.session_state.current_pattern = f"Text: {text_input}"
+    prog.empty()
+else:
+    fig = build_scatter_plot(st.session_state.positions, title=st.session_state.current_pattern)
+    main_canvas.plotly_chart(fig, use_container_width=True)
+
+
+# Panel Statistik Bawah
+if show_stats:
+    st.markdown("### Ringkasan Statistik Operasional")
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Total Agen", f"{st.session_state.n_drones} Unit")
+    c2.metric("Pola Aktif", st.session_state.current_pattern)
+    avg_d = st.session_state.telemetry_df["Distance_m"].mean() if st.session_state.telemetry_df is not None else 0.0
+    c3.metric("Rata-rata Jarak Tempuh", f"{avg_d:.2f} m")
+
+
+    if st.session_state.telemetry_df is not None:
+        st.dataframe(st.session_state.telemetry_df, use_container_width=True, hide_index=True, height=220)
+           
+
+
+
+Cara Menjalankan:
+Masuk ke direktori drone_swarm_simulator lewat terminal:
+cd drone_swarm_simulator
+
+Pasang pustaka pendukung:
+pip install -r requirements.txt
+
+Jalankan aplikasi Streamlit:
+streamlit run app.py
+ 
+ 
+
+
+
+
